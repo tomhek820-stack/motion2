@@ -1,92 +1,116 @@
 import os
-import glob
 import shutil
 import argparse
 import subprocess
-from scenes.intro_scene import render_scene_frames as render_intro
-from scenes.features_scene import render_scene_frames as render_features
+from scenes.story_scenes import render_scene_frame
+from engine.audio import build_final_audio
 
-def encode_scene(frames_dir: str, out_path: str, fps: int):
-    subprocess.run([
+def stream_scene_to_mp4(scene_idx: int, duration: float, width: int, height: int, fps: int, out_mp4: str):
+    total_frames = max(1, int(round(duration * fps)))
+    proc = subprocess.Popen([
         "ffmpeg", "-y",
-        "-framerate", str(fps),
-        "-i", os.path.join(frames_dir, "frame_%05d.png"),
+        "-f", "rawvideo",
+        "-vcodec", "rawvideo",
+        "-s", f"{width}x{height}",
+        "-pix_fmt", "rgb24",
+        "-r", str(fps),
+        "-i", "pipe:0",
         "-c:v", "libx264",
         "-pix_fmt", "yuv420p",
         "-crf", "18",
-        out_path,
-    ], check=True)
+        out_mp4,
+    ], stdin=subprocess.PIPE, stderr=subprocess.DEVNULL)
 
-def find_audio_file() -> str | None:
-    for ext in ("mp3", "wav", "m4a", "ogg"):
-        matches = sorted(glob.glob(os.path.join("assets", "audio", f"*.{ext}")))
-        if matches:
-            return matches[0]
-    return None
+    assert proc.stdin is not None
+    try:
+        for f in range(total_frames):
+            t = f / max(1, total_frames - 1)
+            frame_rgb = render_scene_frame(scene_idx, t, width, height)
+            proc.stdin.write(frame_rgb.tobytes())
+    finally:
+        proc.stdin.close()
+        ret = proc.wait()
+        if ret != 0:
+            raise RuntimeError(f"FFmpeg failed encoding scene {scene_idx} with exit code {ret}")
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--quality", choices=["preview", "final"], default="preview")
+    parser.add_argument("--duration", type=float, default=60.0, help="Total video duration in seconds (45-120 recommended)")
     args = parser.parse_args()
 
+    duration = max(10.0, min(300.0, args.duration))
     if args.quality == "final":
         width, height, fps = 1920, 1080, 60
     else:
         width, height, fps = 1280, 720, 30
 
-    d1 = 3.5
-    d2 = 4.0
+    num_scenes = 6
     xfade_dur = 0.6
+    # توزيع مدة المشاهد بحيث يكون المجموع الكلي بعد التداخل = duration
+    scene_dur = (duration + xfade_dur * (num_scenes - 1)) / num_scenes
 
-    tmp_dir = "tmp_render"
+    tmp_dir = "tmp_full_render"
     out_dir = "output"
     os.makedirs(tmp_dir, exist_ok=True)
     os.makedirs(out_dir, exist_ok=True)
 
-    f1_dir = os.path.join(tmp_dir, "s1")
-    f2_dir = os.path.join(tmp_dir, "s2")
-    v1_path = os.path.join(tmp_dir, "s1.mp4")
-    v2_path = os.path.join(tmp_dir, "s2.mp4")
-    merged_path = os.path.join(tmp_dir, "merged.mp4")
-    final_path = os.path.join(out_dir, f"motion_{args.quality}.mp4")
+    scene_videos = []
+    for idx in range(num_scenes):
+        v_path = os.path.join(tmp_dir, f"scene_{idx}.mp4")
+        stream_scene_to_mp4(idx, scene_dur, width, height, fps, v_path)
+        scene_videos.append(v_path)
 
-    render_intro(width, height, fps, duration=d1, frames_dir=f1_dir)
-    render_features(width, height, fps, duration=d2, frames_dir=f2_dir)
+    # بناء سلسلة xfade بين المشاهد الستة
+    transitions = ["fade", "slideleft", "smoothup", "circleopen", "fade"]
+    inputs = []
+    for v in scene_videos:
+        inputs.extend(["-i", v])
 
-    encode_scene(f1_dir, v1_path, fps)
-    encode_scene(f2_dir, v2_path, fps)
+    filter_chains = []
+    transition_times = []
+    prev_label = "[0:v]"
+    accum_offset = 0.0
 
-    offset = max(0.1, d1 - xfade_dur)
+    for i in range(1, num_scenes):
+        accum_offset += max(0.2, scene_dur - xfade_dur)
+        transition_times.append(accum_offset)
+        out_label = f"[v{i}]" if i < num_scenes - 1 else "[vout]"
+        t_name = transitions[(i - 1) % len(transitions)]
+        filter_chains.append(
+            f"{prev_label}[{i}:v]xfade=transition={t_name}:duration={xfade_dur}:offset={accum_offset:.3f}{out_label}"
+        )
+        prev_label = out_label
+
+    video_only_path = os.path.join(tmp_dir, "video_only.mp4")
     subprocess.run([
         "ffmpeg", "-y",
-        "-i", v1_path,
-        "-i", v2_path,
-        "-filter_complex", f"[0:v][1:v]xfade=transition=fade:duration={xfade_dur}:offset={offset},format=yuv420p[v]",
-        "-map", "[v]",
+        *inputs,
+        "-filter_complex", ";".join(filter_chains),
+        "-map", "[vout]",
         "-c:v", "libx264",
+        "-pix_fmt", "yuv420p",
         "-crf", "18",
-        merged_path,
+        video_only_path,
     ], check=True)
 
-    audio_file = find_audio_file()
-    total_dur = d1 + d2 - xfade_dur
-    if audio_file:
-        subprocess.run([
-            "ffmpeg", "-y",
-            "-i", merged_path,
-            "-stream_loop", "-1",
-            "-i", audio_file,
-            "-t", f"{total_dur:.2f}",
-            "-c:v", "copy",
-            "-c:a", "aac",
-            "-shortest",
-            final_path,
-        ], check=True)
-    else:
-        shutil.copyfile(merged_path, final_path)
+    actual_total_dur = scene_dur * num_scenes - xfade_dur * (num_scenes - 1)
+    audio_path = os.path.join(tmp_dir, "final_audio.aac")
+    build_final_audio(audio_path, duration=actual_total_dur, transitions_times=transition_times, tmp_dir=tmp_dir)
+
+    final_output = os.path.join(out_dir, f"motion_{args.quality}_{int(round(actual_total_dur))}s.mp4")
+    subprocess.run([
+        "ffmpeg", "-y",
+        "-i", video_only_path,
+        "-i", audio_path,
+        "-c:v", "copy",
+        "-c:a", "aac",
+        "-shortest",
+        final_output,
+    ], check=True)
 
     shutil.rmtree(tmp_dir, ignore_errors=True)
-    print(f"Done: {final_path}")
+    print(f"Done: {final_output} ({actual_total_dur:.1f}s)")
 
 if __name__ == "__main__":
     main()
