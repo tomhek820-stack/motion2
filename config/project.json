@@ -1,0 +1,18 @@
+{
+  "duration": 60.0,
+  "theme": {
+    "bg_color": [11, 15, 25],
+    "primary_text": [248, 250, 252],
+    "accent_color": [56, 189, 248],
+    "secondary_accent": [16, 185, 129],
+    "font_path": "assets/fonts/Cairo-Bold.ttf"
+  },
+  "intro": {
+    "title": "محرك موشن جرافيك برمجي احترافي",
+    "subtitle": "إنتاج متكامل 45-120 ثانية بالصوت والحركة والخط العربي"
+  },
+  "outro": {
+    "title": "motion2 • محرك إنتاج مرئي متكامل",
+    "subtitle": "اختبار سريع في Termux وتصيير سحابي عبر GitHub Actions"
+  }
+}
