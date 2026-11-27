@@ -3,7 +3,10 @@ import glob
 import math
 import subprocess
 import numpy as np
+import sherpa_onnx
 from engine.project_config import load_project_config
+
+SUPERTONIC_DIR = "models/sherpa-onnx-supertonic-3-tts-int8-2026-05-11"
 
 def find_audio_assets() -> tuple[str | None, str | None]:
     bgm = None
@@ -18,58 +21,72 @@ def find_audio_assets() -> tuple[str | None, str | None]:
                 bgm = path
     return bgm, voice
 
-def _synthesize_spoken_line(text: str, out_wav: str, max_dur: float, sample_rate: int = 44100):
-    # توليد صوت كلامي إيقاعي واضح (formant + syllable envelope) يطابق طول الجملة العربية
-    words = [w for w in text.strip().split() if w]
-    syllables = sum(max(1, len(w) // 2) for w in words) if words else 4
-    est_dur = min(max_dur, max(1.4, min(max_dur * 0.92, syllables * 0.14)))
-    total_samples = max(1, int(est_dur * sample_rate))
-    t = np.arange(total_samples, dtype=np.float64) / sample_rate
+def _create_supertonic_tts():
+    model_dir = SUPERTONIC_DIR
+    if not os.path.isdir(model_dir):
+        matches = glob.glob("models/*supertonic*", recursive=False)
+        if matches:
+            model_dir = matches[0]
+    if not os.path.isdir(model_dir):
+        return None
 
-    # غلاف مقاطع كلامية متناسقة مع الكلمات
-    syl_rate = max(2.2, syllables / max(0.5, est_dur))
-    syl_phase = (t * syl_rate) % 1.0
-    syl_env = np.sin(np.pi * syl_phase) ** 1.4
+    dur_pred = os.path.join(model_dir, "duration_predictor.int8.onnx")
+    txt_enc = os.path.join(model_dir, "text_encoder.int8.onnx")
+    vec_est = os.path.join(model_dir, "vector_estimator.int8.onnx")
+    voc = os.path.join(model_dir, "vocoder.int8.onnx")
+    tts_json = os.path.join(model_dir, "tts.json")
+    idx_bin = os.path.join(model_dir, "unicode_indexer.bin")
+    voice_bin = os.path.join(model_dir, "voice.bin")
 
-    # غلاف جملة (دخول وخروج ناعم)
-    sent_env = np.minimum(1.0, t / 0.14) * np.minimum(1.0, (est_dur - t) / 0.20)
-    sent_env = np.maximum(0.0, sent_env)
+    if not all(os.path.isfile(p) for p in (dur_pred, txt_enc, vec_est, voc)):
+        return None
 
-    # طبقة صوتية دافئة بنبرة كلامية متغيرة قليلاً لتجنب الرتابة
-    f0 = 132.0 + 14.0 * np.sin(2.0 * np.pi * 0.85 * t)
-    phase = 2.0 * np.pi * np.cumsum(f0) / sample_rate
+    num_threads = min(4, os.cpu_count() or 2)
 
-    # توافقيات صوتية قريبة من طابع الصوت البشري
-    voice_wave = (
-        0.55 * np.sin(phase)
-        + 0.32 * np.sin(2.0 * phase + 0.3)
-        + 0.18 * np.sin(3.0 * phase + 0.7)
-        + 0.08 * np.sin(5.0 * phase)
+    supertonic_cfg = sherpa_onnx.OfflineTtsSupertonicConfig(
+        duration_predictor=dur_pred,
+        text_encoder=txt_enc,
+        vector_estimator=vec_est,
+        vocoder=voc,
+        tts_json=tts_json if os.path.isfile(tts_json) else "",
+        unicode_indexer=idx_bin if os.path.isfile(idx_bin) else "",
+        voice=voice_bin if os.path.isfile(voice_bin) else "",
     )
 
-    # همس خفيف مصاحب للمقاطع لإضفاء وضوح نطقي
-    rng = np.random.default_rng(abs(hash(text)) % (2**32))
-    breath = rng.standard_normal(total_samples) * 0.06 * syl_env
+    model_cfg = sherpa_onnx.OfflineTtsModelConfig(
+        supertonic=supertonic_cfg,
+        num_threads=num_threads,
+        debug=False,
+        provider="cpu",
+    )
 
-    signal = (voice_wave * 0.55 * syl_env + breath) * sent_env
-    signal = np.clip(signal, -0.9, 0.9)
+    tts_cfg = sherpa_onnx.OfflineTtsConfig(model=model_cfg)
+    return sherpa_onnx.OfflineTts(tts_cfg)
 
-    pcm16 = (signal * 32767.0).astype(np.int16)
-    stereo = np.column_stack((pcm16, pcm16)).tobytes()
-
+def _save_samples_wav(samples, sample_rate: int, out_wav: str):
+    arr = np.asarray(samples, dtype=np.float32)
+    arr = np.clip(arr, -0.98, 0.98)
+    pcm16 = (arr * 32767.0).astype(np.int16).tobytes()
     subprocess.run([
         "ffmpeg", "-y",
         "-f", "s16le",
         "-ar", str(sample_rate),
-        "-ac", "2",
+        "-ac", "1",
         "-i", "pipe:0",
+        "-ar", "44100",
+        "-ac", "2",
         "-c:a", "pcm_s16le",
         out_wav,
-    ], input=stereo, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    ], input=pcm16, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-def _build_narration_track(lines: list[str], out_wav: str, total_duration: float, sample_rate: int = 44100) -> bool:
+def _build_supertonic_narration(lines: list[str], out_wav: str, total_duration: float, sid: int = 5, speed: float = 1.0) -> bool:
     if not lines:
         return False
+
+    tts = _create_supertonic_tts()
+    if tts is None:
+        return False
+
     tmp_dir = os.path.dirname(out_wav)
     n_lines = len(lines)
     slot_dur = total_duration / max(1, n_lines)
@@ -77,27 +94,57 @@ def _build_narration_track(lines: list[str], out_wav: str, total_duration: float
     inputs = [
         "-f", "lavfi",
         "-t", f"{total_duration:.3f}",
-        "-i", f"anullsrc=r={sample_rate}:cl=stereo",
+        "-i", "anullsrc=r=44100:cl=stereo",
     ]
     filter_parts = []
     mix_labels = ["[0:a]"]
+    generated_any = False
 
     for idx, line in enumerate(lines):
-        seg_wav = os.path.join(tmp_dir, f"vo_seg_{idx}.wav")
-        _synthesize_spoken_line(line, seg_wav, max_dur=max(1.2, slot_dur - 0.6), sample_rate=sample_rate)
+        seg_wav = os.path.join(tmp_dir, f"st3_seg_{idx}.wav")
+        audio = None
+
+        if hasattr(tts, "generate_with_config") and hasattr(sherpa_onnx, "GenerationConfig"):
+            try:
+                gcfg = sherpa_onnx.GenerationConfig()
+                if hasattr(gcfg, "sid"):
+                    gcfg.sid = sid
+                if hasattr(gcfg, "speed"):
+                    gcfg.speed = speed
+                for attr in ("lang", "language", "language_code"):
+                    if hasattr(gcfg, attr):
+                        setattr(gcfg, attr, "ar")
+                        break
+                audio = tts.generate_with_config(line, gcfg)
+            except Exception:
+                audio = None
+
+        if audio is None:
+            try:
+                audio = tts.generate(line, sid=sid, speed=speed)
+            except TypeError:
+                audio = tts.generate(line)
+
+        if audio is None or not getattr(audio, "samples", None) or len(audio.samples) == 0:
+            continue
+
+        sr = int(getattr(audio, "sample_rate", 24000) or 24000)
+        _save_samples_wav(audio.samples, sr, seg_wav)
         if not os.path.isfile(seg_wav) or os.path.getsize(seg_wav) < 200:
             continue
 
-        in_idx = idx + 1
-        delay_ms = int(idx * slot_dur * 1000) + 300
+        in_idx = len(mix_labels)
+        delay_ms = int(idx * slot_dur * 1000) + 250
+        max_len = max(0.8, slot_dur - 0.5)
         inputs.extend(["-i", seg_wav])
         lbl = f"vo{idx}"
         filter_parts.append(
-            f"[{in_idx}:a]asetpts=PTS-STARTPTS,volume=1.30,adelay={delay_ms}|{delay_ms}[{lbl}]"
+            f"[{in_idx}:a]atrim=0:{max_len:.3f},asetpts=PTS-STARTPTS,volume=1.35,adelay={delay_ms}|{delay_ms}[{lbl}]"
         )
         mix_labels.append(f"[{lbl}]")
+        generated_any = True
 
-    if len(mix_labels) == 1:
+    if not generated_any:
         return False
 
     filter_parts.append(
@@ -194,6 +241,9 @@ def build_final_audio(
 ):
     cfg = load_project_config()
     narration_lines = cfg.get("narration", [])
+    voice_cfg = cfg.get("voice", {})
+    sid = int(voice_cfg.get("sid", 5))
+    speed = float(voice_cfg.get("speed", 1.0))
 
     bgm_file, voice_file = find_audio_assets()
     if bgm_file is None:
@@ -201,15 +251,15 @@ def build_final_audio(
         synthesize_ambient_music(bgm_file, duration=duration)
 
     if voice_file is None and narration_lines:
-        vo_out = os.path.join(tmp_dir, "narration_track.wav")
-        if _build_narration_track(narration_lines, vo_out, total_duration=duration):
+        vo_out = os.path.join(tmp_dir, "supertonic_narration.wav")
+        if _build_supertonic_narration(narration_lines, vo_out, total_duration=duration, sid=sid, speed=speed):
             voice_file = vo_out
 
     inputs = ["-stream_loop", "-1", "-i", bgm_file]
     filter_parts = []
     idx = 1
 
-    bgm_vol = "0.26" if voice_file else "0.85"
+    bgm_vol = "0.25" if voice_file else "0.85"
     filter_parts.append(
         f"[0:a]atrim=0:{duration:.3f},asetpts=PTS-STARTPTS,volume={bgm_vol},afade=t=in:st=0:d=1.2,afade=t=out:st={max(0.0, duration-1.8):.3f}:d=1.8[bgm]"
     )
@@ -231,7 +281,7 @@ def build_final_audio(
                 "-i", "anoisesrc=color=pink:amplitude=0.18",
             ])
             filter_parts.append(
-                f"[{idx}:a]highpass=f=260,lowpass=f=1800,afade=t=in:st=0:d=0.08,afade=t=out:st=0.10:d=0.18,volume=0.32,adelay={max(0, int((t_ev-0.12)*1000))}|{max(0, int((t_ev-0.12)*1000))}[{swish_label}]"
+                f"[{idx}:a]highpass=f=260,lowpass=f=1800,afade=t=in:st=0:d=0.08,afade=t=out:st=0.10:d=0.18,volume=0.30,adelay={max(0, int((t_ev-0.12)*1000))}|{max(0, int((t_ev-0.12)*1000))}[{swish_label}]"
             )
             mix_labels.append(f"[{swish_label}]")
             idx += 1
