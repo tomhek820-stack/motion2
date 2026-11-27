@@ -12,3 +12,8 @@ PALETTE = {
     "text": (248, 250, 252),
     "muted": (148, 163, 184),
 }
+
+BG_COLOR = (13, 17, 26)
+PRIMARY_TEXT = (248, 250, 252)
+ACCENT_COLOR = (56, 189, 248)
+FONT_PATH = "assets/fonts/Cairo-Bold.ttf"
