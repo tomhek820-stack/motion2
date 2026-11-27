@@ -21,16 +21,9 @@ def _is_arabic_char(ch: str) -> bool:
 
 def shape_ar(text: str) -> str:
     reshaped = _RESHAPER.reshape(text)
-    words = reshaped.split(" ")
-    out_words = []
-    for w in words:
-        if any(_is_arabic_char(c) for c in w):
-            # عكس أحرف الكلمة العربية لتظهر من اليمين لليسار عند رسمها LTR في Pillow
-            out_words.append(w[::-1])
-        else:
-            out_words.append(w)
-    # عكس ترتيب الكلمات لتبدأ الجملة العربية من اليمين
-    return " ".join(reversed(out_words))
+    if any(_is_arabic_char(c) for c in reshaped):
+        return reshaped[::-1]
+    return reshaped
 
 def draw_masked_text(
     canvas: Image.Image,
