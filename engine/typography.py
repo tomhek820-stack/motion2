@@ -1,5 +1,7 @@
-import arabic_reshaper
+import numpy as np
 from PIL import Image, ImageDraw, ImageFont
+import arabic_reshaper
+from bidi.algorithm import get_display
 
 _RESHAPER = arabic_reshaper.ArabicReshaper(
     configuration={
@@ -9,21 +11,12 @@ _RESHAPER = arabic_reshaper.ArabicReshaper(
     }
 )
 
-def _is_arabic_char(ch: str) -> bool:
-    code = ord(ch)
-    return (
-        (0x0600 <= code <= 0x06FF)
-        or (0x0750 <= code <= 0x077F)
-        or (0x08A0 <= code <= 0x08FF)
-        or (0xFB50 <= code <= 0xFDFF)
-        or (0xFE70 <= code <= 0xFEFF)
-    )
-
-def shape_ar(text: str) -> str:
-    reshaped = _RESHAPER.reshape(text)
-    if any(_is_arabic_char(c) for c in reshaped):
-        return reshaped[::-1]
-    return reshaped
+def _format_text(text: str, font: ImageFont.FreeTypeFont) -> str:
+    has_arabic = any(0x0600 <= ord(ch) <= 0x08FF or 0xFB50 <= ord(ch) <= 0xFEFF for ch in text)
+    if has_arabic and hasattr(ImageFont, "Layout") and hasattr(ImageFont.Layout, "RAQM"):
+        return text
+    reshaped = _RESHAPER.reshape(text) if has_arabic else text
+    return get_display(reshaped, base_dir="R") if has_arabic else reshaped
 
 def draw_masked_text(
     canvas: Image.Image,
@@ -37,28 +30,46 @@ def draw_masked_text(
     slide_px: int = 28,
 ):
     progress = max(0.0, min(1.0, progress))
-    font = ImageFont.truetype(font_path, font_size)
-    shaped = shape_ar(text)
+    if progress <= 0.0:
+        return
 
-    layer = Image.new("RGBA", canvas.size, (0, 0, 0, 0))
-    draw = ImageDraw.Draw(layer)
+    has_arabic = any(0x0600 <= ord(ch) <= 0x08FF or 0xFB50 <= ord(ch) <= 0xFEFF for ch in text)
+    use_raqm = bool(has_arabic and hasattr(ImageFont, "Layout") and hasattr(ImageFont.Layout, "RAQM"))
 
-    bbox = draw.textbbox((0, 0), shaped, font=font)
-    w = bbox[2] - bbox[0]
-    h = bbox[3] - bbox[1]
+    font = ImageFont.truetype(font_path, font_size, layout_engine=ImageFont.Layout.RAQM if use_raqm else None)
+    rendered_str = _format_text(text, font)
 
-    x = center_x - w // 2
-    y = target_y + int(slide_px * (1.0 - progress))
+    pad = max(12, font_size // 2)
+    probe = Image.new("RGBA", (10, 10), (0, 0, 0, 0))
+    pdraw = ImageDraw.Draw(probe)
 
-    draw.text((x - bbox[0], y - bbox[1]), shaped, font=font, fill=(*fill, 255))
+    draw_kwargs = {"font": font, "fill": (*fill, 255)}
+    if use_raqm:
+        draw_kwargs["direction"] = "rtl"
+        draw_kwargs["language"] = "ar"
 
-    mask = Image.new("L", canvas.size, 0)
-    mdraw = ImageDraw.Draw(mask)
-    visible_h = int(h * progress) + 18
-    mdraw.rectangle(
-        [x - 40, target_y + h - visible_h, x + w + 40, target_y + h + 40],
-        fill=255,
-    )
+    bbox_kwargs = {"font": font}
+    if use_raqm:
+        bbox_kwargs["direction"] = "rtl"
+        bbox_kwargs["language"] = "ar"
 
-    layer.putalpha(mask)
-    canvas.alpha_composite(layer)
+    bbox = pdraw.textbbox((0, 0), rendered_str, **bbox_kwargs)
+    tw = max(1, bbox[2] - bbox[0])
+    th = max(1, bbox[3] - bbox[1])
+
+    layer = Image.new("RGBA", (tw + pad * 2, th + pad * 2), (0, 0, 0, 0))
+    ldraw = ImageDraw.Draw(layer)
+    ldraw.text((pad - bbox[0], pad - bbox[1]), rendered_str, **draw_kwargs)
+
+    # تطبيق قناع الظهور التدريجي من الأسفل للأعلى عبر NumPy
+    arr = np.array(layer, dtype=np.uint8)
+    lh = arr.shape[0]
+    visible_h = max(1, int(lh * progress))
+    if visible_h < lh:
+        arr[: lh - visible_h, :, 3] = 0
+
+    masked = Image.fromarray(arr, mode="RGBA")
+    x = center_x - (masked.width // 2)
+    y = target_y + int(slide_px * (1.0 - progress)) - pad
+
+    canvas.alpha_composite(masked, dest=(x, y))
