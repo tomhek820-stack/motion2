@@ -33,6 +33,18 @@ def stream_scene_to_mp4(scene_idx: int, duration: float, width: int, height: int
         if ret != 0:
             raise RuntimeError(f"FFmpeg failed encoding scene {scene_idx} with exit code {ret}")
 
+def copy_preview_to_downloads(src_path: str):
+    candidates = [
+        os.path.expanduser("~/storage/downloads"),
+        "/sdcard/Download",
+    ]
+    for dl_dir in candidates:
+        if os.path.isdir(dl_dir) and os.access(dl_dir, os.W_OK):
+            dest_path = os.path.join(dl_dir, os.path.basename(src_path))
+            shutil.copy2(src_path, dest_path)
+            print(f"Copied preview to Downloads: {dest_path}")
+            return
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--quality", choices=["preview", "final"], default="preview")
@@ -47,7 +59,6 @@ def main():
 
     num_scenes = 6
     xfade_dur = 0.6
-    # توزيع مدة المشاهد بحيث يكون المجموع الكلي بعد التداخل = duration
     scene_dur = (duration + xfade_dur * (num_scenes - 1)) / num_scenes
 
     tmp_dir = "tmp_full_render"
@@ -61,7 +72,6 @@ def main():
         stream_scene_to_mp4(idx, scene_dur, width, height, fps, v_path)
         scene_videos.append(v_path)
 
-    # بناء سلسلة xfade بين المشاهد الستة
     transitions = ["fade", "slideleft", "smoothup", "circleopen", "fade"]
     inputs = []
     for v in scene_videos:
@@ -108,6 +118,9 @@ def main():
         "-shortest",
         final_output,
     ], check=True)
+
+    if args.quality == "preview":
+        copy_preview_to_downloads(final_output)
 
     shutil.rmtree(tmp_dir, ignore_errors=True)
     print(f"Done: {final_output} ({actual_total_dur:.1f}s)")
