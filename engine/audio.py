@@ -43,7 +43,7 @@ def _create_supertonic_tts():
 
     num_threads = min(4, os.cpu_count() or 2)
 
-    supertonic_cfg = sherpa_onnx.OfflineTtsSupertonicConfig(
+    supertonic_cfg = sherpa_onnx.OfflineTtsSupertonicModelConfig(
         duration_predictor=dur_pred,
         text_encoder=txt_enc,
         vector_estimator=vec_est,
