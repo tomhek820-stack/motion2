@@ -5,17 +5,34 @@ from PIL import Image, ImageDraw, ImageFont
 _RESHAPER = arabic_reshaper.ArabicReshaper(
     configuration={
         "delete_harakat": False,
-        "support_ligatures": True,
+        "support_ligatures": False,
         "shift_harakat_position": False,
     }
 )
 
+def _is_arabic_char(ch: str) -> bool:
+    code = ord(ch)
+    return (
+        (0x0600 <= code <= 0x06FF)
+        or (0x0750 <= code <= 0x077F)
+        or (0x08A0 <= code <= 0x08FF)
+        or (0xFB50 <= code <= 0xFDFF)
+        or (0xFE70 <= code <= 0xFEFF)
+    )
+
 def shape_ar(text: str) -> str:
     reshaped = _RESHAPER.reshape(text)
-    try:
-        return get_display(reshaped, upper_is_rtl=False, base_dir="R")
-    except TypeError:
-        return get_display(reshaped)
+    # إذا كان النص يحتوي حروفاً عربية، نرتب الكلمات من اليمين لليسار ونشكّل كل كلمة عربية على حدة
+    if any(_is_arabic_char(c) for c in reshaped):
+        words = reshaped.split(" ")
+        processed_words = []
+        for w in words:
+            if any(_is_arabic_char(c) for c in w):
+                processed_words.append(get_display(w, base_dir="R"))
+            else:
+                processed_words.append(w)
+        return " ".join(reversed(processed_words))
+    return get_display(reshaped)
 
 def draw_masked_text(
     canvas: Image.Image,
