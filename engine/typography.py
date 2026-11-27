@@ -2,8 +2,20 @@ import arabic_reshaper
 from bidi.algorithm import get_display
 from PIL import Image, ImageDraw, ImageFont
 
+_RESHAPER = arabic_reshaper.ArabicReshaper(
+    configuration={
+        "delete_harakat": False,
+        "support_ligatures": True,
+        "shift_harakat_position": False,
+    }
+)
+
 def shape_ar(text: str) -> str:
-    return get_display(arabic_reshaper.reshape(text))
+    reshaped = _RESHAPER.reshape(text)
+    try:
+        return get_display(reshaped, upper_is_rtl=False, base_dir="R")
+    except TypeError:
+        return get_display(reshaped)
 
 def draw_masked_text(
     canvas: Image.Image,
@@ -14,7 +26,7 @@ def draw_masked_text(
     center_x: int,
     target_y: int,
     progress: float,
-    slide_px: int = 32,
+    slide_px: int = 28,
 ):
     progress = max(0.0, min(1.0, progress))
     font = ImageFont.truetype(font_path, font_size)
@@ -34,9 +46,9 @@ def draw_masked_text(
 
     mask = Image.new("L", canvas.size, 0)
     mdraw = ImageDraw.Draw(mask)
-    visible_h = int(h * progress) + 14
+    visible_h = int(h * progress) + 18
     mdraw.rectangle(
-        [x - 24, target_y + h - visible_h, x + w + 24, target_y + h + 24],
+        [x - 40, target_y + h - visible_h, x + w + 40, target_y + h + 40],
         fill=255,
     )
 
