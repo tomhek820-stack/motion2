@@ -1,5 +1,4 @@
 import arabic_reshaper
-from bidi.algorithm import get_display
 from PIL import Image, ImageDraw, ImageFont
 
 _RESHAPER = arabic_reshaper.ArabicReshaper(
@@ -22,17 +21,16 @@ def _is_arabic_char(ch: str) -> bool:
 
 def shape_ar(text: str) -> str:
     reshaped = _RESHAPER.reshape(text)
-    # إذا كان النص يحتوي حروفاً عربية، نرتب الكلمات من اليمين لليسار ونشكّل كل كلمة عربية على حدة
-    if any(_is_arabic_char(c) for c in reshaped):
-        words = reshaped.split(" ")
-        processed_words = []
-        for w in words:
-            if any(_is_arabic_char(c) for c in w):
-                processed_words.append(get_display(w, base_dir="R"))
-            else:
-                processed_words.append(w)
-        return " ".join(reversed(processed_words))
-    return get_display(reshaped)
+    words = reshaped.split(" ")
+    out_words = []
+    for w in words:
+        if any(_is_arabic_char(c) for c in w):
+            # عكس أحرف الكلمة العربية لتظهر من اليمين لليسار عند رسمها LTR في Pillow
+            out_words.append(w[::-1])
+        else:
+            out_words.append(w)
+    # عكس ترتيب الكلمات لتبدأ الجملة العربية من اليمين
+    return " ".join(reversed(out_words))
 
 def draw_masked_text(
     canvas: Image.Image,
