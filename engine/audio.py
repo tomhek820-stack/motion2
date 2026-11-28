@@ -87,77 +87,83 @@ def _build_supertonic_narration(lines: list[str], out_wav: str, total_duration: 
     if tts is None:
         return False
 
+    max_sid = max(0, int(getattr(tts, "num_speakers", 10)) - 1)
+    safe_sid = max(0, min(sid, max_sid))
+
     tmp_dir = os.path.dirname(out_wav)
     n_lines = len(lines)
     slot_dur = total_duration / max(1, n_lines)
 
-    inputs = [
-        "-f", "lavfi",
-        "-t", f"{total_duration:.3f}",
-        "-i", "anullsrc=r=44100:cl=stereo",
-    ]
-    filter_parts = []
-    mix_labels = ["[0:a]"]
-    generated_any = False
+    # بناء مسار زمني متصل بطول total_duration عبر تجميع المقاطع والفواصل الزمنية
+    concat_inputs = []
+    concat_parts = []
+    seg_counter = 0
 
     for idx, line in enumerate(lines):
-        seg_wav = os.path.join(tmp_dir, f"st3_seg_{idx}.wav")
-        audio = None
+        if not str(line).strip():
+            continue
+        slot_start = idx * slot_dur + 0.20
+        slot_end = min(total_duration, (idx + 1) * slot_dur - 0.25)
+        avail_dur = max(0.0, slot_end - slot_start)
+        if avail_dur <= 0.1:
+            continue
 
-        if hasattr(tts, "generate_with_config") and hasattr(sherpa_onnx, "GenerationConfig"):
-            try:
-                gcfg = sherpa_onnx.GenerationConfig()
-                if hasattr(gcfg, "sid"):
-                    gcfg.sid = sid
-                if hasattr(gcfg, "speed"):
-                    gcfg.speed = speed
-                for attr in ("lang", "language", "language_code"):
-                    if hasattr(gcfg, attr):
-                        setattr(gcfg, attr, "ar")
-                        break
-                audio = tts.generate_with_config(line, gcfg)
-            except Exception:
-                audio = None
+        # فراغ صامت قبل بداية الجملة في هذا المقطع الزمني
+        gap_dur = max(0.0, slot_start - (idx * slot_dur))
+        if gap_dur > 0.02:
+            gap_wav = os.path.join(tmp_dir, f"st3_gap_{idx}.wav")
+            subprocess.run([
+                "ffmpeg", "-y",
+                "-f", "lavfi",
+                "-t", f"{gap_dur:.3f}",
+                "-i", "anullsrc=r=44100:cl=stereo",
+                "-c:a", "pcm_s16le",
+                gap_wav,
+            ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            concat_inputs.extend(["-i", gap_wav])
+            concat_parts.append(f"[{seg_counter}:a]")
+            seg_counter += 1
 
-        if audio is None:
-            try:
-                audio = tts.generate(line, sid=sid, speed=speed)
-            except TypeError:
-                audio = tts.generate(line)
-
+        raw_seg_wav = os.path.join(tmp_dir, f"st3_raw_{idx}.wav")
+        audio = tts.generate(str(line).strip(), sid=safe_sid, speed=speed)
         if audio is None or not getattr(audio, "samples", None) or len(audio.samples) == 0:
             continue
 
-        sr = int(getattr(audio, "sample_rate", 24000) or 24000)
-        _save_samples_wav(audio.samples, sr, seg_wav)
-        if not os.path.isfile(seg_wav) or os.path.getsize(seg_wav) < 200:
-            continue
+        sr = int(getattr(audio, "sample_rate", 44100) or 44100)
+        _save_samples_wav(audio.samples, sr, raw_seg_wav)
 
-        in_idx = len(mix_labels)
-        delay_ms = int(idx * slot_dur * 1000) + 250
-        max_len = max(0.8, slot_dur - 0.5)
-        inputs.extend(["-i", seg_wav])
-        lbl = f"vo{idx}"
-        filter_parts.append(
-            f"[{in_idx}:a]atrim=0:{max_len:.3f},asetpts=PTS-STARTPTS,volume=1.35,adelay={delay_ms}|{delay_ms}[{lbl}]"
-        )
-        mix_labels.append(f"[{lbl}]")
-        generated_any = True
+        # قص أو إكمال المقطع ليطابق نافذة المشهد بدقة
+        target_win = max(0.2, (idx + 1) * slot_dur - (idx * slot_dur + gap_dur))
+        win_wav = os.path.join(tmp_dir, f"st3_win_{idx}.wav")
+        subprocess.run([
+            "ffmpeg", "-y",
+            "-i", raw_seg_wav,
+            "-af", f"apad=whole_dur={target_win:.3f},atrim=0:{target_win:.3f},asetpts=PTS-STARTPTS",
+            "-c:a", "pcm_s16le",
+            win_wav,
+        ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-    if not generated_any:
+        concat_inputs.extend(["-i", win_wav])
+        concat_parts.append(f"[{seg_counter}:a]")
+        seg_counter += 1
+
+    if seg_counter == 0:
         return False
 
-    filter_parts.append(
-        f"{''.join(mix_labels)}amix=inputs={len(mix_labels)}:duration=first:dropout_transition=1,alimiter=limit=0.95[vo_out]"
-    )
+    filter_expr = f"{''.join(concat_parts)}concat=n={seg_counter}:v=0:a=1,atrim=0:{total_duration:.3f},asetpts=PTS-STARTPTS[vo_out]"
+    subprocess.run([
+        "ffmpeg", "-y",
+        *concat_inputs,
+        "-filter_complex", filter_expr,
+        "-map", "[vo_out]",
+        "-c:a", "pcm_s16le",
+        out_wav,
+    ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-    subprocess.run(
-        ["ffmpeg", "-y", *inputs, "-filter_complex", ";".join(filter_parts), "-map", "[vo_out]", "-c:a", "pcm_s16le", out_wav],
-        check=True,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-    return os.path.isfile(out_wav) and os.path.getsize(out_wav) > 200
+    ok = os.path.isfile(out_wav) and os.path.getsize(out_wav) > 400
+    if ok:
+        print(f"Supertonic 3 narration ready: {out_wav} ({os.path.getsize(out_wav)} bytes)")
+    return ok
 
 def synthesize_ambient_music(out_wav: str, duration: float, sample_rate: int = 44100):
     total_samples = int(duration * sample_rate)
@@ -259,7 +265,7 @@ def build_final_audio(
     filter_parts = []
     idx = 1
 
-    bgm_vol = "0.25" if voice_file else "0.85"
+    bgm_vol = "0.22" if voice_file else "0.85"
     filter_parts.append(
         f"[0:a]atrim=0:{duration:.3f},asetpts=PTS-STARTPTS,volume={bgm_vol},afade=t=in:st=0:d=1.2,afade=t=out:st={max(0.0, duration-1.8):.3f}:d=1.8[bgm]"
     )
@@ -268,7 +274,7 @@ def build_final_audio(
 
     if voice_file:
         inputs.extend(["-i", voice_file])
-        filter_parts.append(f"[{idx}:a]atrim=0:{duration:.3f},asetpts=PTS-STARTPTS,volume=1.35[vo]")
+        filter_parts.append(f"[{idx}:a]atrim=0:{duration:.3f},asetpts=PTS-STARTPTS,volume=1.55[vo]")
         mix_labels.append("[vo]")
         idx += 1
 
@@ -281,7 +287,7 @@ def build_final_audio(
                 "-i", "anoisesrc=color=pink:amplitude=0.18",
             ])
             filter_parts.append(
-                f"[{idx}:a]highpass=f=260,lowpass=f=1800,afade=t=in:st=0:d=0.08,afade=t=out:st=0.10:d=0.18,volume=0.30,adelay={max(0, int((t_ev-0.12)*1000))}|{max(0, int((t_ev-0.12)*1000))}[{swish_label}]"
+                f"[{idx}:a]highpass=f=260,lowpass=f=1800,afade=t=in:st=0:d=0.08,afade=t=out:st=0.10:d=0.18,volume=0.25,adelay={max(0, int((t_ev-0.12)*1000))}|{max(0, int((t_ev-0.12)*1000))}[{swish_label}]"
             )
             mix_labels.append(f"[{swish_label}]")
             idx += 1
