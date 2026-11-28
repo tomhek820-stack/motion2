@@ -21,6 +21,61 @@ def find_audio_assets() -> tuple[str | None, str | None]:
                 bgm = path
     return bgm, voice
 
+def _extract_narration_lines(cfg: dict) -> list[str]:
+    lines: list[str] = []
+
+    raw_narr = cfg.get("narration")
+    if isinstance(raw_narr, list):
+        for item in raw_narr:
+            if isinstance(item, str) and item.strip():
+                lines.append(item.strip())
+            elif isinstance(item, dict):
+                for k in ("text", "narration", "script", "title"):
+                    v = item.get(k)
+                    if isinstance(v, str) and v.strip():
+                        lines.append(v.strip())
+                        break
+    elif isinstance(raw_narr, str) and raw_narr.strip():
+        lines.append(raw_narr.strip())
+
+    if lines:
+        return lines
+
+    for section_key in ("intro", "outro"):
+        sec = cfg.get(section_key)
+        if isinstance(sec, str) and sec.strip():
+            lines.append(sec.strip())
+        elif isinstance(sec, dict):
+            parts = []
+            for k in ("title", "subtitle", "text", "narration", "description"):
+                v = sec.get(k)
+                if isinstance(v, str) and v.strip():
+                    parts.append(v.strip())
+            if parts:
+                lines.append(" . ".join(parts))
+
+    scenes = cfg.get("scenes")
+    if isinstance(scenes, list):
+        for sc in scenes:
+            if isinstance(sc, str) and sc.strip():
+                lines.append(sc.strip())
+            elif isinstance(sc, dict):
+                for k in ("narration", "text", "title", "subtitle", "description"):
+                    v = sc.get(k)
+                    if isinstance(v, str) and v.strip():
+                        lines.append(v.strip())
+                        break
+
+    if not lines:
+        lines = [
+            "مرحباً بكم في محرك الموشن الجرافيك البرمجي المتكامل.",
+            "تصميم وتوليد المشاهد والانتقالات بسلاسة عالية.",
+            "تعليق صوتي عربي واضح متزامن مع الموسيقى الخلفية.",
+            "تصدير سريع وجاهز للمعاينة والمشاركة الفورية.",
+        ]
+
+    return lines
+
 def _create_supertonic_tts():
     model_dir = SUPERTONIC_DIR
     if not os.path.isdir(model_dir):
@@ -131,7 +186,6 @@ def _build_supertonic_narration(lines: list[str], out_wav: str, total_duration: 
         sr = int(getattr(audio, "sample_rate", 44100) or 44100)
         _save_samples_wav(audio.samples, sr, raw_seg_wav)
 
-        # عدم قص الجملة إلا إذا تجاوزت نهاية الفيديو الإجمالي
         rem_total = max(0.1, total_duration - cursor)
         seg_wav = os.path.join(tmp_dir, f"st3_seg_{idx}.wav")
         subprocess.run([
@@ -159,7 +213,6 @@ def _build_supertonic_narration(lines: list[str], out_wav: str, total_duration: 
     if seg_counter == 0:
         return False
 
-    # إكمال المتبقي إلى total_duration إذا كان المجموع أقصر
     if cursor < total_duration - 0.02:
         tail_dur = total_duration - cursor
         tail_wav = os.path.join(tmp_dir, "st3_tail.wav")
@@ -187,7 +240,7 @@ def _build_supertonic_narration(lines: list[str], out_wav: str, total_duration: 
 
     ok = os.path.isfile(out_wav) and os.path.getsize(out_wav) > 400
     if ok:
-        print(f"Supertonic 3 narration ready (sid={safe_sid}): {out_wav}")
+        print(f"Supertonic 3 narration ready (sid={safe_sid}, lines={len(lines)}): {out_wav}")
     return ok
 
 def synthesize_ambient_music(out_wav: str, duration: float, sample_rate: int = 44100):
@@ -271,8 +324,8 @@ def build_final_audio(
     tmp_dir: str,
 ):
     cfg = load_project_config()
-    narration_lines = cfg.get("narration", [])
-    voice_cfg = cfg.get("voice", {})
+    narration_lines = _extract_narration_lines(cfg)
+    voice_cfg = cfg.get("voice") if isinstance(cfg.get("voice"), dict) else {}
     sid = int(voice_cfg.get("sid", 5))
     speed = float(voice_cfg.get("speed", 1.0))
 
@@ -290,7 +343,7 @@ def build_final_audio(
     filter_parts = []
     idx = 1
 
-    bgm_vol = "0.16" if voice_file else "0.85"
+    bgm_vol = "0.14" if voice_file else "0.85"
     filter_parts.append(
         f"[0:a]atrim=0:{duration:.3f},asetpts=PTS-STARTPTS,volume={bgm_vol},afade=t=in:st=0:d=1.2,afade=t=out:st={max(0.0, duration-1.8):.3f}:d=1.8[bgm]"
     )
@@ -299,7 +352,7 @@ def build_final_audio(
 
     if voice_file:
         inputs.extend(["-i", voice_file])
-        filter_parts.append(f"[{idx}:a]atrim=0:{duration:.3f},asetpts=PTS-STARTPTS,volume=1.65[vo]")
+        filter_parts.append(f"[{idx}:a]atrim=0:{duration:.3f},asetpts=PTS-STARTPTS,volume=1.75[vo]")
         mix_labels.append("[vo]")
         idx += 1
 
@@ -312,7 +365,7 @@ def build_final_audio(
                 "-i", "anoisesrc=color=pink:amplitude=0.18",
             ])
             filter_parts.append(
-                f"[{idx}:a]highpass=f=260,lowpass=f=1800,afade=t=in:st=0:d=0.08,afade=t=out:st=0.10:d=0.18,volume=0.20,adelay={max(0, int((t_ev-0.12)*1000))}|{max(0, int((t_ev-0.12)*1000))}[{swish_label}]"
+                f"[{idx}:a]highpass=f=260,lowpass=f=1800,afade=t=in:st=0:d=0.08,afade=t=out:st=0.10:d=0.18,volume=0.18,adelay={max(0, int((t_ev-0.12)*1000))}|{max(0, int((t_ev-0.12)*1000))}[{swish_label}]"
             )
             mix_labels.append(f"[{swish_label}]")
             idx += 1
