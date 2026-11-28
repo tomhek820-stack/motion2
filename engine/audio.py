@@ -94,22 +94,20 @@ def _build_supertonic_narration(lines: list[str], out_wav: str, total_duration: 
     n_lines = len(lines)
     slot_dur = total_duration / max(1, n_lines)
 
-    # بناء مسار زمني متصل بطول total_duration عبر تجميع المقاطع والفواصل الزمنية
     concat_inputs = []
     concat_parts = []
     seg_counter = 0
+    cursor = 0.0
 
     for idx, line in enumerate(lines):
-        if not str(line).strip():
-            continue
-        slot_start = idx * slot_dur + 0.20
-        slot_end = min(total_duration, (idx + 1) * slot_dur - 0.25)
-        avail_dur = max(0.0, slot_end - slot_start)
-        if avail_dur <= 0.1:
+        if cursor >= total_duration - 0.15:
+            break
+        clean_line = str(line).strip()
+        if not clean_line:
             continue
 
-        # فراغ صامت قبل بداية الجملة في هذا المقطع الزمني
-        gap_dur = max(0.0, slot_start - (idx * slot_dur))
+        desired_start = idx * slot_dur + 0.15
+        gap_dur = max(0.0, desired_start - cursor)
         if gap_dur > 0.02:
             gap_wav = os.path.join(tmp_dir, f"st3_gap_{idx}.wav")
             subprocess.run([
@@ -123,32 +121,59 @@ def _build_supertonic_narration(lines: list[str], out_wav: str, total_duration: 
             concat_inputs.extend(["-i", gap_wav])
             concat_parts.append(f"[{seg_counter}:a]")
             seg_counter += 1
+            cursor += gap_dur
 
         raw_seg_wav = os.path.join(tmp_dir, f"st3_raw_{idx}.wav")
-        audio = tts.generate(str(line).strip(), sid=safe_sid, speed=speed)
+        audio = tts.generate(clean_line, sid=safe_sid, speed=speed)
         if audio is None or not getattr(audio, "samples", None) or len(audio.samples) == 0:
             continue
 
         sr = int(getattr(audio, "sample_rate", 44100) or 44100)
         _save_samples_wav(audio.samples, sr, raw_seg_wav)
 
-        # قص أو إكمال المقطع ليطابق نافذة المشهد بدقة
-        target_win = max(0.2, (idx + 1) * slot_dur - (idx * slot_dur + gap_dur))
-        win_wav = os.path.join(tmp_dir, f"st3_win_{idx}.wav")
+        # عدم قص الجملة إلا إذا تجاوزت نهاية الفيديو الإجمالي
+        rem_total = max(0.1, total_duration - cursor)
+        seg_wav = os.path.join(tmp_dir, f"st3_seg_{idx}.wav")
         subprocess.run([
             "ffmpeg", "-y",
             "-i", raw_seg_wav,
-            "-af", f"apad=whole_dur={target_win:.3f},atrim=0:{target_win:.3f},asetpts=PTS-STARTPTS",
+            "-af", f"atrim=0:{rem_total:.3f},asetpts=PTS-STARTPTS",
             "-c:a", "pcm_s16le",
-            win_wav,
+            seg_wav,
         ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-        concat_inputs.extend(["-i", win_wav])
+        probe = subprocess.run([
+            "ffprobe", "-v", "error", "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1", seg_wav
+        ], capture_output=True, text=True, check=False)
+        try:
+            seg_dur = float((probe.stdout or "0").strip())
+        except ValueError:
+            seg_dur = 0.0
+
+        concat_inputs.extend(["-i", seg_wav])
         concat_parts.append(f"[{seg_counter}:a]")
         seg_counter += 1
+        cursor += max(0.0, seg_dur)
 
     if seg_counter == 0:
         return False
+
+    # إكمال المتبقي إلى total_duration إذا كان المجموع أقصر
+    if cursor < total_duration - 0.02:
+        tail_dur = total_duration - cursor
+        tail_wav = os.path.join(tmp_dir, "st3_tail.wav")
+        subprocess.run([
+            "ffmpeg", "-y",
+            "-f", "lavfi",
+            "-t", f"{tail_dur:.3f}",
+            "-i", "anullsrc=r=44100:cl=stereo",
+            "-c:a", "pcm_s16le",
+            tail_wav,
+        ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        concat_inputs.extend(["-i", tail_wav])
+        concat_parts.append(f"[{seg_counter}:a]")
+        seg_counter += 1
 
     filter_expr = f"{''.join(concat_parts)}concat=n={seg_counter}:v=0:a=1,atrim=0:{total_duration:.3f},asetpts=PTS-STARTPTS[vo_out]"
     subprocess.run([
@@ -162,7 +187,7 @@ def _build_supertonic_narration(lines: list[str], out_wav: str, total_duration: 
 
     ok = os.path.isfile(out_wav) and os.path.getsize(out_wav) > 400
     if ok:
-        print(f"Supertonic 3 narration ready: {out_wav} ({os.path.getsize(out_wav)} bytes)")
+        print(f"Supertonic 3 narration ready (sid={safe_sid}): {out_wav}")
     return ok
 
 def synthesize_ambient_music(out_wav: str, duration: float, sample_rate: int = 44100):
@@ -265,7 +290,7 @@ def build_final_audio(
     filter_parts = []
     idx = 1
 
-    bgm_vol = "0.22" if voice_file else "0.85"
+    bgm_vol = "0.16" if voice_file else "0.85"
     filter_parts.append(
         f"[0:a]atrim=0:{duration:.3f},asetpts=PTS-STARTPTS,volume={bgm_vol},afade=t=in:st=0:d=1.2,afade=t=out:st={max(0.0, duration-1.8):.3f}:d=1.8[bgm]"
     )
@@ -274,7 +299,7 @@ def build_final_audio(
 
     if voice_file:
         inputs.extend(["-i", voice_file])
-        filter_parts.append(f"[{idx}:a]atrim=0:{duration:.3f},asetpts=PTS-STARTPTS,volume=1.55[vo]")
+        filter_parts.append(f"[{idx}:a]atrim=0:{duration:.3f},asetpts=PTS-STARTPTS,volume=1.65[vo]")
         mix_labels.append("[vo]")
         idx += 1
 
@@ -287,7 +312,7 @@ def build_final_audio(
                 "-i", "anoisesrc=color=pink:amplitude=0.18",
             ])
             filter_parts.append(
-                f"[{idx}:a]highpass=f=260,lowpass=f=1800,afade=t=in:st=0:d=0.08,afade=t=out:st=0.10:d=0.18,volume=0.25,adelay={max(0, int((t_ev-0.12)*1000))}|{max(0, int((t_ev-0.12)*1000))}[{swish_label}]"
+                f"[{idx}:a]highpass=f=260,lowpass=f=1800,afade=t=in:st=0:d=0.08,afade=t=out:st=0.10:d=0.18,volume=0.20,adelay={max(0, int((t_ev-0.12)*1000))}|{max(0, int((t_ev-0.12)*1000))}[{swish_label}]"
             )
             mix_labels.append(f"[{swish_label}]")
             idx += 1
