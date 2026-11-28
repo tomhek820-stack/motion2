@@ -36,7 +36,7 @@ def _create_supertonic_tts():
     voc = os.path.join(model_dir, "vocoder.int8.onnx")
     tts_json = os.path.join(model_dir, "tts.json")
     idx_bin = os.path.join(model_dir, "unicode_indexer.bin")
-    voice_bin = os.path.join(model_dir, "voice.bin")
+    voice_style = os.path.join(model_dir, "voice.bin")
 
     if not all(os.path.isfile(p) for p in (dur_pred, txt_enc, vec_est, voc)):
         return None
@@ -50,7 +50,7 @@ def _create_supertonic_tts():
         vocoder=voc,
         tts_json=tts_json if os.path.isfile(tts_json) else "",
         unicode_indexer=idx_bin if os.path.isfile(idx_bin) else "",
-        voice=voice_bin if os.path.isfile(voice_bin) else "",
+        voice_style=voice_style if os.path.isfile(voice_style) else "",
     )
 
     model_cfg = sherpa_onnx.OfflineTtsModelConfig(
